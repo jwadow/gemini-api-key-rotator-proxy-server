@@ -18,13 +18,13 @@ APP = FastAPI(title="Native Gemini proxy (auth-mode auto-detect)")
 # -------------------------
 # Config
 # -------------------------
-VPN_PROXY_URL = ""  # proxy to bypass regional restrictions, for example "192.168.1.103:2080" or "" to disable
+VPN_PROXY_URL = "192.168.1.103:2080"  # proxy to bypass regional restrictions, for example "192.168.1.103:2080" or "" to disable
 KEYS_FILE = "api_keys.txt" # api keys, one per line
 ADMIN_TOKEN = "changeme_local_only"
 UPSTREAM_BASE_GEMINI = "https://generativelanguage.googleapis.com/v1beta"
 BACKOFF_MIN = 5
 BACKOFF_MAX = 600
-DEBUG = False
+DEBUG = True
 
 # -------------------------
 # Setup proxy from config (optional http proxy)
@@ -188,6 +188,10 @@ def map_incoming_to_upstream(path: str) -> str:
 
 
 def detect_stream_from_request(content_bytes: Optional[bytes], query_params: Dict[str, Any]) -> bool:
+    # Gemini native streaming uses alt=sse
+    if query_params.get("alt") == "sse":
+        return True
+    # Also support stream=true for compatibility with some clients
     qp = query_params.get("stream")
     if qp in ("true", "True", "1", True):
         return True
@@ -238,6 +242,13 @@ async def catch_all(request: Request, full_path: str):
     content = await request.body()
     params = dict(request.query_params)
     is_stream = detect_stream_from_request(content if content else None, params)
+
+    # If streaming is requested, modify the upstream URL and clean up params
+    if is_stream and ":generateContent" in upstream_url:
+        upstream_url = upstream_url.replace(":generateContent", ":streamGenerateContent")
+        # clean up param that Gemini API does not use, to avoid potential errors
+        if 'stream' in params:
+            del params['stream']
 
     # copy incoming headers but skip hop-by-hop
     incoming_headers: Dict[str, str] = {}
@@ -317,6 +328,22 @@ async def catch_all(request: Request, full_path: str):
                 is_stream=is_stream,
                 key_state=key_state,
             )
+
+            # For non-streaming responses, check for retryable errors. If found, continue to next key.
+            # Note: Streaming responses with errors will still be passed to the client without retry.
+            if isinstance(result, Response) and not isinstance(result, StreamingResponse):
+                if result.status_code in (429, 403, 500, 502, 503):
+                    # key_state.mark_failure() is already called inside try_forward_to_upstream
+                    try:
+                        error_body = json.loads(result.body)
+                        errors.append({"key_preview": key_state.key[:8] + "...", "error": error_body, "status_code": result.status_code})
+                    except:
+                        errors.append({"key_preview": key_state.key[:8] + "...", "error": bytes(result.body).decode(errors='ignore'), "status_code": result.status_code})
+                    if DEBUG:
+                        print(f"[DEBUG] Key {key_state.key[:12]}... failed with status {result.status_code}. Retrying with next key.")
+                    continue  # Try next key
+
+            # This is a success, a non-retryable error, or a stream -> return immediately
             return result
         except httpx.RequestError as e:
             key_state.mark_failure()

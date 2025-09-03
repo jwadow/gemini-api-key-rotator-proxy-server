@@ -1,3 +1,4 @@
 __pycache__
-api_keys.txt
-official.py
+test-openai-official.py
+*copy*.py
+*.txt

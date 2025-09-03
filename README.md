@@ -74,7 +74,7 @@ uvicorn main-openai:APP --host 127.0.0.1 --port 8000
 ### Example Usage
 
 #### With `openai` Python library
-The `test.py` file demonstrates how to use the proxy with the `openai` Python library.
+The `test-openai.py` file demonstrates how to use the proxy with the `openai` Python library.
 
 #### With Roo Code
 
