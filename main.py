@@ -12,19 +12,21 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import Response, JSONResponse, StreamingResponse
 import httpx
+import logging
 
+log = logging.getLogger("uvicorn")
 APP = FastAPI(title="Native Gemini proxy (auth-mode auto-detect)")
 
 # -------------------------
 # Config
 # -------------------------
-VPN_PROXY_URL = "192.168.1.103:2080"  # proxy to bypass regional restrictions, for example "192.168.1.103:2080" or "" to disable
+VPN_PROXY_URL = ""  # proxy to bypass regional restrictions, for example "192.168.1.103:2080" or "" to disable
 KEYS_FILE = "api_keys.txt" # api keys, one per line
 ADMIN_TOKEN = "changeme_local_only"
 UPSTREAM_BASE_GEMINI = "https://generativelanguage.googleapis.com/v1beta"
 BACKOFF_MIN = 5
 BACKOFF_MAX = 600
-DEBUG = True
+DEBUG = False
 
 # -------------------------
 # Setup proxy from config (optional http proxy)
@@ -100,7 +102,7 @@ class KeyPool:
         out: List[Dict[str, Any]] = []
         for s in self.states:
             out.append({
-                "key_preview": (s.key[:8] + "...") if len(s.key) > 8 else s.key,
+                "key_preview": (s.key[:12] + "...") if len(s.key) > 8 else s.key,
                 "available_in": max(0, round(s.banned_until - now, 2)),
                 "backoff": s.backoff,
                 "success": s.success,
@@ -110,63 +112,6 @@ class KeyPool:
 
 
 POOL = KeyPool(KEYS_LIST)
-
-# -------------------------
-# Upstream forwarding helpers
-# -------------------------
-async def stream_from_upstream(
-    method: str,
-    upstream_url: str,
-    headers: Dict[str, str],
-    params: Dict[str, Any],
-    content: Optional[bytes],
-    key_state: KeyState,
-    timeout: int = 300,
-):
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            async with client.stream(method, upstream_url, headers=headers, params=params, content=content) as upstream:
-                if upstream.status_code >= 400:
-                    body = await upstream.aread()
-                    key_state.mark_failure()
-                    if body:
-                        yield body
-                    return
-                key_state.mark_success()
-                async for chunk in upstream.aiter_bytes():
-                    if chunk:
-                        yield chunk
-        except httpx.RequestError:
-            key_state.mark_failure()
-            raise
-
-
-async def try_forward_to_upstream(
-    method: str,
-    upstream_url: str,
-    headers: Dict[str, str],
-    params: Dict[str, Any],
-    content: Optional[bytes],
-    is_stream: bool,
-    key_state: KeyState,
-    timeout: int = 300,
-):
-    """
-    Forward request to upstream using provided headers and params (already prepared).
-    """
-    if is_stream:
-        gen = stream_from_upstream(method, upstream_url, headers, params, content, key_state, timeout=timeout)
-        return StreamingResponse(gen, media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
-    else:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.request(method, upstream_url, headers=headers, params=params, content=content)
-            if resp.status_code in (429, 403, 500, 502, 503):
-                key_state.mark_failure()
-            else:
-                key_state.mark_success()
-            media_type = resp.headers.get("content-type", "application/json")
-            return Response(content=resp.content, status_code=resp.status_code, media_type=media_type)
-
 
 # -------------------------
 # Routing helpers (fixed: avoid double v1/v1beta)
@@ -238,126 +183,135 @@ def prepare_auth_for_key(incoming_headers: Dict[str, str], incoming_params: Dict
 @APP.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def catch_all(request: Request, full_path: str):
     upstream_url = map_incoming_to_upstream(full_path)
-
     content = await request.body()
     params = dict(request.query_params)
+
+    # copy incoming headers but skip hop-by-hop
+    incoming_headers: Dict[str, str] = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")
+    }
+
     is_stream = detect_stream_from_request(content if content else None, params)
 
-    # If streaming is requested, modify the upstream URL and clean up params
     if is_stream and ":generateContent" in upstream_url:
         upstream_url = upstream_url.replace(":generateContent", ":streamGenerateContent")
-        # clean up param that Gemini API does not use, to avoid potential errors
         if 'stream' in params:
             del params['stream']
 
-    # copy incoming headers but skip hop-by-hop
-    incoming_headers: Dict[str, str] = {}
-    for k, v in request.headers.items():
-        if k.lower() in ("host", "content-length", "transfer-encoding", "connection"):
-            continue
-        incoming_headers[k] = v
+    # --- Streaming requests ---
+    if is_stream:
+        async def stream_generator():
+            tried_keys, logged_errors = [], []
+            for _ in range(len(POOL.states)):
+                key_state = await POOL.next_available()
+                if not key_state: break
+                tried_keys.append(key_state.key[:12] + "...")
+                headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state)
+                if not any(k.lower() == "content-type" for k in headers_auth.keys()):
+                    headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
-    tried: List[str] = []
-    errors: List[Dict[str, Any]] = []
+                if DEBUG: print(f"[DEBUG] Attempting stream with key {key_state.key[:12]}...")
+                try:
+                    async with httpx.AsyncClient(timeout=300) as client, client.stream(
+                        request.method, upstream_url, headers=headers_auth, params=params_auth, content=content
+                    ) as upstream:
+                        if upstream.status_code >= 400:
+                            key_state.mark_failure()
+                            body = await upstream.aread()
+                            logged_errors.append({"key": key_state.key[:12], "status": upstream.status_code, "body": body.decode(errors='ignore')})
+                            log.warning(f"Key {key_state.key[:12]}... failed on stream connection with status {upstream.status_code}. Retrying...")
+                            continue
 
-    # Normalize path for /models detection (strip leading v1/v1beta if present)
-    p_normal = full_path.lstrip("/")
-    if p_normal.startswith("v1/"):
-        p_normal = p_normal[len("v1/"):]
-    elif p_normal.startswith("v1beta/"):
-        p_normal = p_normal[len("v1beta/"):]
+                        is_first_chunk, stream_had_error = True, False
+                        async for chunk in upstream.aiter_bytes():
+                            if is_first_chunk:
+                                is_first_chunk = False
+                                # Gemini streams a 'data: ' prefix, which we can ignore for error checking
+                                chunk_content_for_check = chunk
+                                if chunk_content_for_check.startswith(b'data: '):
+                                    chunk_content_for_check = chunk_content_for_check[len(b'data: '):]
+                                
+                                try:
+                                    # The first chunk might be a list with a single error object
+                                    data = json.loads(chunk_content_for_check.decode())
+                                    if isinstance(data, list): data = data
 
-    # Special handling for models listing: use random available key (prefer available)
-    if p_normal == "models" or p_normal.startswith("models/"):
-        avail = [s for s in POOL.states if s.is_available()]
-        key_state = random.choice(avail) if avail else min(POOL.states, key=lambda s: s.banned_until)
-        tried.append(key_state.key[:8] + "...")
-        headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state)
+                                    if isinstance(data, dict) and "error" in data:
+                                        key_state.mark_failure()
+                                        stream_had_error = True
+                                        msg = data.get("error", {}).get("message", "Unknown stream error")
+                                        logged_errors.append({"key": key_state.key[:12], "status": "in-stream", "body": msg})
+                                        if DEBUG: print(f"[DEBUG] In-stream error for key {key_state.key[:12]}...: {msg}")
+                                        break 
+                                except (json.JSONDecodeError, UnicodeDecodeError, IndexError): pass
+                            yield chunk
+                        
+                        if stream_had_error: continue
+                        key_state.mark_success()
+                        client_info = f" to {request.client.host}:{request.client.port}" if request.client else ""
+                        log.info(f"Stream{client_info} completed successfully with key {key_state.key[:12]}...")
+                        return
+                except httpx.RequestError as e:
+                    key_state.mark_failure()
+                    logged_errors.append({"key": key_state.key[:12], "error": str(e)})
+                    if DEBUG: print(f"[DEBUG] Request error for stream key {key_state.key[:12]}...: {e}")
+                    continue
+            
+            if not tried_keys:
+                log.error("All keys are within rate limit. Could not process stream request.")
 
-        # ensure Content-Type present
-        if not any(k.lower() == "content-type" for k in headers_auth.keys()):
-            ct = request.headers.get("content-type")
-            headers_auth["Content-Type"] = ct if ct else "application/json"
+            #FIXME: Roo Code doesn't understand this error
+            final_error = {"error": {"code": 502, "message": "All keys failed for streaming request.", "details": logged_errors}}
+            yield (f"data: {json.dumps(final_error)}\r\n\r\n").encode()
+        
+        return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
 
-        if DEBUG:
-            print(f"[DEBUG] /models using key {key_state.key[:12]}..., forwarding to {upstream_url} with params={params_auth}")
+    # --- Non-streaming requests ---
+    else:
+        tried, errors = [], []
+        for _ in range(len(POOL.states)):
+            key_state = await POOL.next_available()
+            if not key_state: break
+            tried.append(key_state.key[:12] + "...")
+            headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state)
+            if not any(k.lower() == "content-type" for k in headers_auth.keys()):
+                headers_auth["Content-Type"] = request.headers.get("content-type", "application/json")
 
-        try:
-            result = await try_forward_to_upstream(
-                method=request.method,
-                upstream_url=upstream_url,
-                headers=headers_auth,
-                params=params_auth,
-                content=content,
-                is_stream=is_stream,
-                key_state=key_state,
-            )
-            return result
-        except httpx.RequestError as e:
-            key_state.mark_failure()
-            errors.append({"key_preview": key_state.key[:8] + "...", "error": str(e)})
-            return JSONResponse({"error": "models upstream request failed", "tried": tried, "errors": errors}, status_code=502)
-        except Exception as e:
-            key_state.mark_failure()
-            errors.append({"key_preview": key_state.key[:8] + "...", "error": str(e)})
-            return JSONResponse({"error": "models upstream request failed", "tried": tried, "errors": errors}, status_code=502)
+            if DEBUG: print(f"[DEBUG] trying key {key_state.key[:12]}... -> {upstream_url}")
+            try:
+                async with httpx.AsyncClient(timeout=300) as client:
+                    resp = await client.request(request.method, upstream_url, headers=headers_auth, params=params_auth, content=content)
+                
+                if resp.status_code < 400:
+                    key_state.mark_success()
+                    client_info = f" from {request.client.host}:{request.client.port}" if request.client else ""
+                    log.info(f"Request{client_info} completed successfully with key {key_state.key[:12]}...")
+                    return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
-    # Normal round-robin flow: try next available key
-    for _ in range(len(POOL.states)):
-        key_state = await POOL.next_available()
-        if key_state is None:
-            break
-        tried.append(key_state.key[:8] + "...")
-        headers_auth, params_auth = prepare_auth_for_key(incoming_headers, params, key_state)
+                # It's an error, mark failure
+                key_state.mark_failure()
+                error_body_str = resp.text
+                if DEBUG: print(f"[DEBUG] Key {key_state.key[:12]}... failed with status {resp.status_code}, body: {error_body_str[:200]}")
 
-        # ensure Content-Type present
-        if not any(k.lower() == "content-type" for k in headers_auth.keys()):
-            ct = request.headers.get("content-type")
-            headers_auth["Content-Type"] = ct if ct else "application/json"
+                # Also treat 400 as retryable for cases like invalid API keys
+                if resp.status_code in (400, 429, 500, 502, 503):
+                    errors.append({"key_preview": key_state.key[:12] + "...", "error": error_body_str, "status_code": resp.status_code})
+                    continue # Retryable error, try next key
+                else:
+                    # Non-retryable error, return immediately
+                    return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
-        if DEBUG:
-            print(f"[DEBUG] trying key {key_state.key[:12]}... -> {upstream_url} params={params_auth}")
+            except httpx.RequestError as e:
+                key_state.mark_failure()
+                errors.append({"key_preview": key_state.key[:12] + "...", "error": str(e)})
+                if DEBUG: print(f"[DEBUG] Request error for key {key_state.key[:12]}...: {e}")
+                continue
 
-        try:
-            result = await try_forward_to_upstream(
-                method=request.method,
-                upstream_url=upstream_url,
-                headers=headers_auth,
-                params=params_auth,
-                content=content,
-                is_stream=is_stream,
-                key_state=key_state,
-            )
-
-            # For non-streaming responses, check for retryable errors. If found, continue to next key.
-            # Note: Streaming responses with errors will still be passed to the client without retry.
-            if isinstance(result, Response) and not isinstance(result, StreamingResponse):
-                if result.status_code in (429, 403, 500, 502, 503):
-                    # key_state.mark_failure() is already called inside try_forward_to_upstream
-                    try:
-                        error_body = json.loads(result.body)
-                        errors.append({"key_preview": key_state.key[:8] + "...", "error": error_body, "status_code": result.status_code})
-                    except:
-                        errors.append({"key_preview": key_state.key[:8] + "...", "error": bytes(result.body).decode(errors='ignore'), "status_code": result.status_code})
-                    if DEBUG:
-                        print(f"[DEBUG] Key {key_state.key[:12]}... failed with status {result.status_code}. Retrying with next key.")
-                    continue  # Try next key
-
-            # This is a success, a non-retryable error, or a stream -> return immediately
-            return result
-        except httpx.RequestError as e:
-            key_state.mark_failure()
-            errors.append({"key_preview": key_state.key[:8] + "...", "error": str(e)})
-            continue
-        except Exception as e:
-            key_state.mark_failure()
-            errors.append({"key_preview": key_state.key[:8] + "...", "error": str(e)})
-            continue
-
-    # no key succeeded or none available
-    if not tried:
-        return JSONResponse({"error": "all keys rate-limited or in backoff"}, status_code=429)
-    return JSONResponse({"error": "no upstream key succeeded", "tried": tried, "errors": errors}, status_code=502)
+        if not tried:
+            log.error("All keys are in backoff. Could not process request.")
+            return JSONResponse({"error": "all keys rate-limited or in backoff"}, status_code=429)
+        return JSONResponse({"error": "no upstream key succeeded", "tried": tried, "errors": errors}, status_code=502)
 
 
 # -------------------------
@@ -370,7 +324,7 @@ def is_admin(auth_header: Optional[str]) -> bool:
         return True
     low = auth_header.lower()
     if low.startswith("bearer "):
-        return auth_header.split(" ", 1)[1] == ADMIN_TOKEN
+        return auth_header.split(" ", 1) == ADMIN_TOKEN
     return False
 
 

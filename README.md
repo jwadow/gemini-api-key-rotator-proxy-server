@@ -63,7 +63,7 @@ This mode directly proxies requests to the Gemini API.
 uvicorn main:APP --host 127.0.0.1 --port 8000
 ```
 
-### OpenAI-Compatible Mode
+### OpenAI-Compatible Mode (it has bugs!)
 
 This mode allows you to use clients compatible with the OpenAI API.
 
@@ -71,12 +71,12 @@ This mode allows you to use clients compatible with the OpenAI API.
 uvicorn main-openai:APP --host 127.0.0.1 --port 8000
 ```
 
-### Example Usage
+## Example Usage
 
-#### With `openai` Python library
+### With `openai` Python library
 The `test-openai.py` file demonstrates how to use the proxy with the `openai` Python library.
 
-#### With Roo Code
+### With Roo Code
 
 **For `main.py` (Native Mode):**
 - Create a new API provider: "Google Gemini".
