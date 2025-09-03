@@ -71,6 +71,19 @@ This mode allows you to use clients compatible with the OpenAI API.
 uvicorn main-openai:APP --host 127.0.0.1 --port 8000
 ```
 
-### Example Usage (OpenAI-Compatible Mode)
+### Example Usage
 
+#### With `openai` Python library
 The `test.py` file demonstrates how to use the proxy with the `openai` Python library.
+
+#### With Roo Code
+
+**For `main.py` (Native Mode):**
+- Create a new API provider: "Google Gemini".
+- Enable "Use custom base URL" and set it to `http://127.0.0.1:8000`.
+
+**For `main-openai.py` (OpenAI-Compatible Mode):**
+- Create a new API provider: "OpenAI Compatible".
+- Set the Base URL to `http://127.0.0.1:8000`.
+- Use any value for the API key (e.g., `changeme_local_only`).
+- Specify the desired model, for example `gemini-2.5-pro`.
